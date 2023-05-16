@@ -1,3 +1,4 @@
+import { vi } from 'vitest'
 import { ParserOptions } from '../src/options'
 import { baseParse, TextModes } from '../src/parse'
 import { ErrorCodes } from '../src/errors'
@@ -10,7 +11,8 @@ import {
   Position,
   TextNode,
   InterpolationNode,
-  ConstantTypes
+  ConstantTypes,
+  DirectiveNode
 } from '../src/ast'
 
 describe('compiler: parse', () => {
@@ -31,7 +33,7 @@ describe('compiler: parse', () => {
     })
 
     test('simple text with invalid end tag', () => {
-      const onError = jest.fn()
+      const onError = vi.fn()
       const ast = baseParse('some text</div>', {
         onError
       })
@@ -377,25 +379,42 @@ describe('compiler: parse', () => {
     })
 
     test('comments option', () => {
-      __DEV__ = false
-      const astDefaultComment = baseParse('<!--abc-->')
-      const astNoComment = baseParse('<!--abc-->', { comments: false })
-      const astWithComments = baseParse('<!--abc-->', { comments: true })
-      __DEV__ = true
+      const astOptionNoComment = baseParse('<!--abc-->', { comments: false })
+      const astOptionWithComments = baseParse('<!--abc-->', { comments: true })
 
-      expect(astDefaultComment.children).toHaveLength(0)
-      expect(astNoComment.children).toHaveLength(0)
-      expect(astWithComments.children).toHaveLength(1)
+      expect(astOptionNoComment.children).toHaveLength(0)
+      expect(astOptionWithComments.children).toHaveLength(1)
     })
 
     // #2217
-    test('comments in the <pre> tag should be removed in production mode', () => {
-      __DEV__ = false
+    test('comments in the <pre> tag should be removed when comments option requires it', () => {
       const rawText = `<p/><!-- foo --><p/>`
-      const ast = baseParse(`<pre>${rawText}</pre>`)
-      __DEV__ = true
 
-      expect((ast.children[0] as ElementNode).children).toMatchObject([
+      const astWithComments = baseParse(`<pre>${rawText}</pre>`, {
+        comments: true
+      })
+      expect(
+        (astWithComments.children[0] as ElementNode).children
+      ).toMatchObject([
+        {
+          type: NodeTypes.ELEMENT,
+          tag: 'p'
+        },
+        {
+          type: NodeTypes.COMMENT
+        },
+        {
+          type: NodeTypes.ELEMENT,
+          tag: 'p'
+        }
+      ])
+
+      const astWithoutComments = baseParse(`<pre>${rawText}</pre>`, {
+        comments: false
+      })
+      expect(
+        (astWithoutComments.children[0] as ElementNode).children
+      ).toMatchObject([
         {
           type: NodeTypes.ELEMENT,
           tag: 'p'
@@ -998,6 +1017,71 @@ describe('compiler: parse', () => {
       })
     })
 
+    // https://github.com/vuejs/core/issues/4251
+    test('class attribute should ignore whitespace when parsed', () => {
+      const ast = baseParse('<div class=" \n\t c \t\n "></div>')
+      const element = ast.children[0] as ElementNode
+
+      expect(element).toStrictEqual({
+        children: [],
+        codegenNode: undefined,
+        isSelfClosing: false,
+        loc: {
+          end: {
+            column: 10,
+            line: 3,
+            offset: 29
+          },
+          source: '<div class=" \n\t c \t\n "></div>',
+          start: {
+            column: 1,
+            line: 1,
+            offset: 0
+          }
+        },
+        ns: Namespaces.HTML,
+        props: [
+          {
+            loc: {
+              end: {
+                column: 3,
+                line: 3,
+                offset: 22
+              },
+              source: 'class=" \n\t c \t\n "',
+              start: {
+                column: 6,
+                line: 1,
+                offset: 5
+              }
+            },
+            name: 'class',
+            type: NodeTypes.ATTRIBUTE,
+            value: {
+              content: 'c',
+              loc: {
+                end: {
+                  column: 3,
+                  line: 3,
+                  offset: 22
+                },
+                source: '" \n\t c \t\n "',
+                start: {
+                  column: 12,
+                  line: 1,
+                  offset: 11
+                }
+              },
+              type: NodeTypes.TEXT
+            }
+          }
+        ],
+        tag: 'div',
+        tagType: ElementTypes.ELEMENT,
+        type: NodeTypes.ELEMENT
+      })
+    })
+
     test('directive with no value', () => {
       const ast = baseParse('<div v-if/>')
       const directive = (ast.children[0] as ElementNode).props[0]
@@ -1077,6 +1161,34 @@ describe('compiler: parse', () => {
           start: { offset: 5, line: 1, column: 6 },
           end: { offset: 15, line: 1, column: 16 },
           source: 'v-on:click'
+        }
+      })
+    })
+
+    // #3494
+    test('directive argument edge case', () => {
+      const ast = baseParse('<div v-slot:slot />')
+      const directive = (ast.children[0] as ElementNode)
+        .props[0] as DirectiveNode
+      expect(directive.arg).toMatchObject({
+        loc: {
+          start: { offset: 12, line: 1, column: 13 },
+          end: { offset: 16, line: 1, column: 17 },
+          source: 'slot'
+        }
+      })
+    })
+
+    // https://github.com/vuejs/language-tools/issues/2710
+    test('directive argument edge case (2)', () => {
+      const ast = baseParse('<div #item.item />')
+      const directive = (ast.children[0] as ElementNode)
+        .props[0] as DirectiveNode
+      expect(directive.arg).toMatchObject({
+        loc: {
+          start: { offset: 6, line: 1, column: 7 },
+          end: { offset: 15, line: 1, column: 16 },
+          source: 'item.item'
         }
       })
     })
@@ -1227,6 +1339,27 @@ describe('compiler: parse', () => {
         }
       })
     })
+    test('directive with no name', () => {
+      let errorCode = -1
+      const ast = baseParse('<div v-/>', {
+        onError: err => {
+          errorCode = err.code as number
+        }
+      })
+      const directive = (ast.children[0] as ElementNode).props[0]
+
+      expect(errorCode).toBe(ErrorCodes.X_MISSING_DIRECTIVE_NAME)
+      expect(directive).toStrictEqual({
+        type: NodeTypes.ATTRIBUTE,
+        name: 'v-',
+        value: undefined,
+        loc: {
+          start: { offset: 5, line: 1, column: 6 },
+          end: { offset: 7, line: 1, column: 8 },
+          source: 'v-'
+        }
+      })
+    })
 
     test('v-bind shorthand', () => {
       const ast = baseParse('<div :a=b />')
@@ -1272,6 +1405,54 @@ describe('compiler: parse', () => {
           start: { offset: 5, line: 1, column: 6 },
           end: { offset: 9, line: 1, column: 10 },
           source: ':a=b'
+        }
+      })
+    })
+
+    test('v-bind .prop shorthand', () => {
+      const ast = baseParse('<div .a=b />')
+      const directive = (ast.children[0] as ElementNode).props[0]
+
+      expect(directive).toStrictEqual({
+        type: NodeTypes.DIRECTIVE,
+        name: 'bind',
+        arg: {
+          type: NodeTypes.SIMPLE_EXPRESSION,
+          content: 'a',
+          isStatic: true,
+          constType: ConstantTypes.CAN_STRINGIFY,
+
+          loc: {
+            source: 'a',
+            start: {
+              column: 7,
+              line: 1,
+              offset: 6
+            },
+            end: {
+              column: 8,
+              line: 1,
+              offset: 7
+            }
+          }
+        },
+        modifiers: ['prop'],
+        exp: {
+          type: NodeTypes.SIMPLE_EXPRESSION,
+          content: 'b',
+          isStatic: false,
+          constType: ConstantTypes.NOT_CONSTANT,
+
+          loc: {
+            start: { offset: 8, line: 1, column: 9 },
+            end: { offset: 9, line: 1, column: 10 },
+            source: 'b'
+          }
+        },
+        loc: {
+          start: { offset: 5, line: 1, column: 6 },
+          end: { offset: 9, line: 1, column: 10 },
+          source: '.a=b'
         }
       })
     })
@@ -1579,6 +1760,54 @@ describe('compiler: parse', () => {
       })
     })
 
+    test('self-closing v-pre', () => {
+      const ast = baseParse(
+        `<div v-pre/>\n<div :id="foo"><Comp/>{{ bar }}</div>`
+      )
+      // should not affect siblings after it
+      const divWithoutPre = ast.children[1] as ElementNode
+      expect(divWithoutPre.props).toMatchObject([
+        {
+          type: NodeTypes.DIRECTIVE,
+          name: `bind`,
+          arg: {
+            type: NodeTypes.SIMPLE_EXPRESSION,
+            isStatic: true,
+            content: `id`
+          },
+          exp: {
+            type: NodeTypes.SIMPLE_EXPRESSION,
+            isStatic: false,
+            content: `foo`
+          },
+          loc: {
+            source: `:id="foo"`,
+            start: {
+              line: 2,
+              column: 6
+            },
+            end: {
+              line: 2,
+              column: 15
+            }
+          }
+        }
+      ])
+      expect(divWithoutPre.children[0]).toMatchObject({
+        type: NodeTypes.ELEMENT,
+        tagType: ElementTypes.COMPONENT,
+        tag: `Comp`
+      })
+      expect(divWithoutPre.children[1]).toMatchObject({
+        type: NodeTypes.INTERPOLATION,
+        content: {
+          type: NodeTypes.SIMPLE_EXPRESSION,
+          content: `bar`,
+          isStatic: false
+        }
+      })
+    })
+
     test('end tags are case-insensitive.', () => {
       const ast = baseParse('<div>hello</DIV>after')
       const element = ast.children[0] as ElementNode
@@ -1645,7 +1874,7 @@ describe('compiler: parse', () => {
       baseParse(`<div>\n<span>\n</div>\n</span>`)
     }).toThrow('Element is missing end tag.')
 
-    const spy = jest.fn()
+    const spy = vi.fn()
     const ast = baseParse(`<div>\n<span>\n</div>\n</span>`, {
       onError: spy
     })
@@ -1736,20 +1965,26 @@ foo
     })
   })
 
-  describe('whitespace management', () => {
+  describe('whitespace management when adopting strategy condense', () => {
+    const parse = (content: string, options?: ParserOptions) =>
+      baseParse(content, {
+        whitespace: 'condense',
+        ...options
+      })
+
     it('should remove whitespaces at start/end inside an element', () => {
-      const ast = baseParse(`<div>   <span/>    </div>`)
+      const ast = parse(`<div>   <span/>    </div>`)
       expect((ast.children[0] as ElementNode).children.length).toBe(1)
     })
 
     it('should remove whitespaces w/ newline between elements', () => {
-      const ast = baseParse(`<div/> \n <div/> \n <div/>`)
+      const ast = parse(`<div/> \n <div/> \n <div/>`)
       expect(ast.children.length).toBe(3)
       expect(ast.children.every(c => c.type === NodeTypes.ELEMENT)).toBe(true)
     })
 
     it('should remove whitespaces adjacent to comments', () => {
-      const ast = baseParse(`<div/> \n <!--foo--> <div/>`)
+      const ast = parse(`<div/> \n <!--foo--> <div/>`)
       expect(ast.children.length).toBe(3)
       expect(ast.children[0].type).toBe(NodeTypes.ELEMENT)
       expect(ast.children[1].type).toBe(NodeTypes.COMMENT)
@@ -1757,7 +1992,7 @@ foo
     })
 
     it('should remove whitespaces w/ newline between comments and elements', () => {
-      const ast = baseParse(`<div/> \n <!--foo--> \n <div/>`)
+      const ast = parse(`<div/> \n <!--foo--> \n <div/>`)
       expect(ast.children.length).toBe(3)
       expect(ast.children[0].type).toBe(NodeTypes.ELEMENT)
       expect(ast.children[1].type).toBe(NodeTypes.COMMENT)
@@ -1765,7 +2000,7 @@ foo
     })
 
     it('should NOT remove whitespaces w/ newline between interpolations', () => {
-      const ast = baseParse(`{{ foo }} \n {{ bar }}`)
+      const ast = parse(`{{ foo }} \n {{ bar }}`)
       expect(ast.children.length).toBe(3)
       expect(ast.children[0].type).toBe(NodeTypes.INTERPOLATION)
       expect(ast.children[1]).toMatchObject({
@@ -1775,8 +2010,19 @@ foo
       expect(ast.children[2].type).toBe(NodeTypes.INTERPOLATION)
     })
 
+    it('should NOT remove whitespaces w/ newline between interpolation and comment', () => {
+      const ast = parse(`<!-- foo --> \n {{msg}}`)
+      expect(ast.children.length).toBe(3)
+      expect(ast.children[0].type).toBe(NodeTypes.COMMENT)
+      expect(ast.children[1]).toMatchObject({
+        type: NodeTypes.TEXT,
+        content: ' '
+      })
+      expect(ast.children[2].type).toBe(NodeTypes.INTERPOLATION)
+    })
+
     it('should NOT remove whitespaces w/o newline between elements', () => {
-      const ast = baseParse(`<div/> <div/> <div/>`)
+      const ast = parse(`<div/> <div/> <div/>`)
       expect(ast.children.length).toBe(5)
       expect(ast.children.map(c => c.type)).toMatchObject([
         NodeTypes.ELEMENT,
@@ -1788,7 +2034,7 @@ foo
     })
 
     it('should condense consecutive whitespaces in text', () => {
-      const ast = baseParse(`   foo  \n    bar     baz     `)
+      const ast = parse(`   foo  \n    bar     baz     `)
       expect((ast.children[0] as TextNode).content).toBe(` foo bar baz `)
     })
 
@@ -1811,6 +2057,103 @@ foo
       expect((preElement.children[1] as TextNode).content).toBe(
         `\n  foo  bar  `
       )
+    })
+
+    it('self-closing pre tag', () => {
+      const ast = baseParse(`<pre/><span>\n  foo   bar</span>`, {
+        isPreTag: tag => tag === 'pre'
+      })
+      const elementAfterPre = ast.children[1] as ElementNode
+      // should not affect the <span> and condense its whitespace inside
+      expect((elementAfterPre.children[0] as TextNode).content).toBe(` foo bar`)
+    })
+
+    it('should NOT condense whitespaces in RCDATA text mode', () => {
+      const ast = baseParse(`<textarea>Text:\n   foo</textarea>`, {
+        getTextMode: ({ tag }) =>
+          tag === 'textarea' ? TextModes.RCDATA : TextModes.DATA
+      })
+      const preElement = ast.children[0] as ElementNode
+      expect(preElement.children).toHaveLength(1)
+      expect((preElement.children[0] as TextNode).content).toBe(`Text:\n   foo`)
+    })
+  })
+
+  describe('whitespace management when adopting strategy preserve', () => {
+    const parse = (content: string, options?: ParserOptions) =>
+      baseParse(content, {
+        whitespace: 'preserve',
+        ...options
+      })
+
+    it('should still remove whitespaces at start/end inside an element', () => {
+      const ast = parse(`<div>   <span/>    </div>`)
+      expect((ast.children[0] as ElementNode).children.length).toBe(1)
+    })
+
+    it('should preserve whitespaces w/ newline between elements', () => {
+      const ast = parse(`<div/> \n <div/> \n <div/>`)
+      expect(ast.children.length).toBe(5)
+      expect(ast.children.map(c => c.type)).toMatchObject([
+        NodeTypes.ELEMENT,
+        NodeTypes.TEXT,
+        NodeTypes.ELEMENT,
+        NodeTypes.TEXT,
+        NodeTypes.ELEMENT
+      ])
+    })
+
+    it('should preserve whitespaces adjacent to comments', () => {
+      const ast = parse(`<div/> \n <!--foo--> <div/>`)
+      expect(ast.children.length).toBe(5)
+      expect(ast.children.map(c => c.type)).toMatchObject([
+        NodeTypes.ELEMENT,
+        NodeTypes.TEXT,
+        NodeTypes.COMMENT,
+        NodeTypes.TEXT,
+        NodeTypes.ELEMENT
+      ])
+    })
+
+    it('should preserve whitespaces w/ newline between comments and elements', () => {
+      const ast = parse(`<div/> \n <!--foo--> \n <div/>`)
+      expect(ast.children.length).toBe(5)
+      expect(ast.children.map(c => c.type)).toMatchObject([
+        NodeTypes.ELEMENT,
+        NodeTypes.TEXT,
+        NodeTypes.COMMENT,
+        NodeTypes.TEXT,
+        NodeTypes.ELEMENT
+      ])
+    })
+
+    it('should preserve whitespaces w/ newline between interpolations', () => {
+      const ast = parse(`{{ foo }} \n {{ bar }}`)
+      expect(ast.children.length).toBe(3)
+      expect(ast.children[0].type).toBe(NodeTypes.INTERPOLATION)
+      expect(ast.children[1]).toMatchObject({
+        type: NodeTypes.TEXT,
+        content: ' '
+      })
+      expect(ast.children[2].type).toBe(NodeTypes.INTERPOLATION)
+    })
+
+    it('should preserve whitespaces w/o newline between elements', () => {
+      const ast = parse(`<div/> <div/> <div/>`)
+      expect(ast.children.length).toBe(5)
+      expect(ast.children.map(c => c.type)).toMatchObject([
+        NodeTypes.ELEMENT,
+        NodeTypes.TEXT,
+        NodeTypes.ELEMENT,
+        NodeTypes.TEXT,
+        NodeTypes.ELEMENT
+      ])
+    })
+
+    it('should preserve consecutive whitespaces in text', () => {
+      const content = `   foo  \n    bar     baz     `
+      const ast = parse(content)
+      expect((ast.children[0] as TextNode).content).toBe(content)
     })
   })
 
@@ -2712,7 +3055,7 @@ foo
       ]
     }
 
-    for (const key of Object.keys(patterns) as (keyof (typeof patterns))[]) {
+    for (const key of Object.keys(patterns)) {
       describe(key, () => {
         for (const { code, errors, options } of patterns[key]) {
           test(
@@ -2721,7 +3064,7 @@ foo
               c => `\\x0${c.codePointAt(0)!.toString(16)};`
             ),
             () => {
-              const spy = jest.fn()
+              const spy = vi.fn()
               const ast = baseParse(code, {
                 getNamespace: (tag, parent) => {
                   const ns = parent ? parent.ns : Namespaces.HTML

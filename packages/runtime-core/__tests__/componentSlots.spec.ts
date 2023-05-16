@@ -1,3 +1,4 @@
+import { vi } from 'vitest'
 import {
   ref,
   render,
@@ -82,7 +83,7 @@ describe('component: slots', () => {
     expect(slots.default()).toMatchObject([normalizeVNode(h('span'))])
   })
 
-  test('updateSlots: instance.slots should be update correctly (when slotType is number)', async () => {
+  test('updateSlots: instance.slots should be updated correctly (when slotType is number)', async () => {
     const flag1 = ref(true)
 
     let instance: any
@@ -124,7 +125,7 @@ describe('component: slots', () => {
     expect(instance.slots).toHaveProperty('two')
   })
 
-  test('updateSlots: instance.slots should be update correctly (when slotType is null)', async () => {
+  test('updateSlots: instance.slots should be updated correctly (when slotType is null)', async () => {
     const flag1 = ref(true)
 
     let instance: any
@@ -200,7 +201,7 @@ describe('component: slots', () => {
   test('should respect $stable flag', async () => {
     const flag1 = ref(1)
     const flag2 = ref(2)
-    const spy = jest.fn()
+    const spy = vi.fn()
 
     const Child = () => {
       spy()

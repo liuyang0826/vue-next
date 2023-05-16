@@ -1,8 +1,13 @@
+import { vi } from 'vitest'
 import {
   CompilerOptions,
   baseParse as parse,
   transform,
-  ErrorCodes
+  ErrorCodes,
+  BindingTypes,
+  NodeTransform,
+  transformExpression,
+  baseCompile
 } from '../../src'
 import {
   RESOLVE_COMPONENT,
@@ -15,7 +20,11 @@ import {
   RESOLVE_DYNAMIC_COMPONENT,
   SUSPENSE,
   KEEP_ALIVE,
-  BASE_TRANSITION
+  BASE_TRANSITION,
+  NORMALIZE_CLASS,
+  NORMALIZE_STYLE,
+  NORMALIZE_PROPS,
+  GUARD_REACTIVE_PROPS
 } from '../../src/runtimeHelpers'
 import {
   NodeTypes,
@@ -55,9 +64,11 @@ function parseWithElementTransform(
   }
 }
 
-function parseWithBind(template: string) {
+function parseWithBind(template: string, options?: CompilerOptions) {
   return parseWithElementTransform(template, {
+    ...options,
     directiveTransforms: {
+      ...options?.directiveTransforms,
       bind: transformBind
     }
   })
@@ -70,12 +81,88 @@ describe('compiler: element transform', () => {
     expect(root.components).toContain(`Foo`)
   })
 
-  test('resolve implcitly self-referencing component', () => {
+  test('resolve implicitly self-referencing component', () => {
     const { root } = parseWithElementTransform(`<Example/>`, {
       filename: `/foo/bar/Example.vue?vue&type=template`
     })
     expect(root.helpers).toContain(RESOLVE_COMPONENT)
-    expect(root.components).toContain(`_self`)
+    expect(root.components).toContain(`Example__self`)
+  })
+
+  test('resolve component from setup bindings', () => {
+    const { root, node } = parseWithElementTransform(`<Example/>`, {
+      bindingMetadata: {
+        Example: BindingTypes.SETUP_MAYBE_REF
+      }
+    })
+    expect(root.helpers).not.toContain(RESOLVE_COMPONENT)
+    expect(node.tag).toBe(`$setup["Example"]`)
+  })
+
+  test('resolve component from setup bindings (inline)', () => {
+    const { root, node } = parseWithElementTransform(`<Example/>`, {
+      inline: true,
+      bindingMetadata: {
+        Example: BindingTypes.SETUP_MAYBE_REF
+      }
+    })
+    expect(root.helpers).not.toContain(RESOLVE_COMPONENT)
+    expect(node.tag).toBe(`_unref(Example)`)
+  })
+
+  test('resolve component from setup bindings (inline const)', () => {
+    const { root, node } = parseWithElementTransform(`<Example/>`, {
+      inline: true,
+      bindingMetadata: {
+        Example: BindingTypes.SETUP_CONST
+      }
+    })
+    expect(root.helpers).not.toContain(RESOLVE_COMPONENT)
+    expect(node.tag).toBe(`Example`)
+  })
+
+  test('resolve namespaced component from setup bindings', () => {
+    const { root, node } = parseWithElementTransform(`<Foo.Example/>`, {
+      bindingMetadata: {
+        Foo: BindingTypes.SETUP_MAYBE_REF
+      }
+    })
+    expect(root.helpers).not.toContain(RESOLVE_COMPONENT)
+    expect(node.tag).toBe(`$setup["Foo"].Example`)
+  })
+
+  test('resolve namespaced component from setup bindings (inline)', () => {
+    const { root, node } = parseWithElementTransform(`<Foo.Example/>`, {
+      inline: true,
+      bindingMetadata: {
+        Foo: BindingTypes.SETUP_MAYBE_REF
+      }
+    })
+    expect(root.helpers).not.toContain(RESOLVE_COMPONENT)
+    expect(node.tag).toBe(`_unref(Foo).Example`)
+  })
+
+  test('resolve namespaced component from setup bindings (inline const)', () => {
+    const { root, node } = parseWithElementTransform(`<Foo.Example/>`, {
+      inline: true,
+      bindingMetadata: {
+        Foo: BindingTypes.SETUP_CONST
+      }
+    })
+    expect(root.helpers).not.toContain(RESOLVE_COMPONENT)
+    expect(node.tag).toBe(`Foo.Example`)
+  })
+
+  test('do not resolve component from non-script-setup bindings', () => {
+    const bindingMetadata = {
+      Example: BindingTypes.SETUP_MAYBE_REF
+    }
+    Object.defineProperty(bindingMetadata, '__isScriptSetup', { value: false })
+    const { root } = parseWithElementTransform(`<Example/>`, {
+      bindingMetadata
+    })
+    expect(root.helpers).toContain(RESOLVE_COMPONENT)
+    expect(root.components).toContain(`Example`)
   })
 
   test('static props', () => {
@@ -134,11 +221,25 @@ describe('compiler: element transform', () => {
     const { root, node } = parseWithElementTransform(`<div v-bind="obj" />`)
     // single v-bind doesn't need mergeProps
     expect(root.helpers).not.toContain(MERGE_PROPS)
+    expect(root.helpers).toContain(NORMALIZE_PROPS)
+    expect(root.helpers).toContain(GUARD_REACTIVE_PROPS)
 
     // should directly use `obj` in props position
     expect(node.props).toMatchObject({
-      type: NodeTypes.SIMPLE_EXPRESSION,
-      content: `obj`
+      type: NodeTypes.JS_CALL_EXPRESSION,
+      callee: NORMALIZE_PROPS,
+      arguments: [
+        {
+          type: NodeTypes.JS_CALL_EXPRESSION,
+          callee: GUARD_REACTIVE_PROPS,
+          arguments: [
+            {
+              type: NodeTypes.SIMPLE_EXPRESSION,
+              content: `obj`
+            }
+          ]
+        }
+      ]
     })
   })
 
@@ -228,6 +329,37 @@ describe('compiler: element transform', () => {
             {
               type: NodeTypes.SIMPLE_EXPRESSION,
               content: `obj`
+            },
+            `true`
+          ]
+        },
+        createObjectMatcher({
+          class: 'bar'
+        })
+      ]
+    })
+  })
+
+  test('v-on="obj" on component', () => {
+    const { root, node } = parseWithElementTransform(
+      `<Foo id="foo" v-on="obj" class="bar" />`
+    )
+    expect(root.helpers).toContain(MERGE_PROPS)
+
+    expect(node.props).toMatchObject({
+      type: NodeTypes.JS_CALL_EXPRESSION,
+      callee: MERGE_PROPS,
+      arguments: [
+        createObjectMatcher({
+          id: 'foo'
+        }),
+        {
+          type: NodeTypes.JS_CALL_EXPRESSION,
+          callee: TO_HANDLERS,
+          arguments: [
+            {
+              type: NodeTypes.SIMPLE_EXPRESSION,
+              content: `obj`
             }
           ]
         },
@@ -258,7 +390,8 @@ describe('compiler: element transform', () => {
             {
               type: NodeTypes.SIMPLE_EXPRESSION,
               content: `handlers`
-            }
+            },
+            `true`
           ]
         },
         {
@@ -399,7 +532,7 @@ describe('compiler: element transform', () => {
   })
 
   test('error on v-bind with no argument', () => {
-    const onError = jest.fn()
+    const onError = vi.fn()
     parseWithElementTransform(`<div v-bind/>`, { onError })
     expect(onError.mock.calls[0]).toMatchObject([
       {
@@ -630,7 +763,7 @@ describe('compiler: element transform', () => {
   })
 
   test(`props merging: style`, () => {
-    const { node } = parseWithElementTransform(
+    const { node, root } = parseWithElementTransform(
       `<div style="color: green" :style="{ color: 'red' }" />`,
       {
         nodeTransforms: [transformStyle, transformElement],
@@ -639,6 +772,7 @@ describe('compiler: element transform', () => {
         }
       }
     )
+    expect(root.helpers).toContain(NORMALIZE_STYLE)
     expect(node.props).toMatchObject({
       type: NodeTypes.JS_OBJECT_EXPRESSION,
       properties: [
@@ -650,17 +784,23 @@ describe('compiler: element transform', () => {
             isStatic: true
           },
           value: {
-            type: NodeTypes.JS_ARRAY_EXPRESSION,
-            elements: [
+            type: NodeTypes.JS_CALL_EXPRESSION,
+            callee: NORMALIZE_STYLE,
+            arguments: [
               {
-                type: NodeTypes.SIMPLE_EXPRESSION,
-                content: `{"color":"green"}`,
-                isStatic: false
-              },
-              {
-                type: NodeTypes.SIMPLE_EXPRESSION,
-                content: `{ color: 'red' }`,
-                isStatic: false
+                type: NodeTypes.JS_ARRAY_EXPRESSION,
+                elements: [
+                  {
+                    type: NodeTypes.SIMPLE_EXPRESSION,
+                    content: `{"color":"green"}`,
+                    isStatic: false
+                  },
+                  {
+                    type: NodeTypes.SIMPLE_EXPRESSION,
+                    content: `{ color: 'red' }`,
+                    isStatic: false
+                  }
+                ]
               }
             ]
           }
@@ -669,8 +809,70 @@ describe('compiler: element transform', () => {
     })
   })
 
+  test(`props merging: style w/ transformExpression`, () => {
+    const { node, root } = parseWithElementTransform(
+      `<div style="color: green" :style="{ color: 'red' }" />`,
+      {
+        nodeTransforms: [transformExpression, transformStyle, transformElement],
+        directiveTransforms: {
+          bind: transformBind
+        },
+        prefixIdentifiers: true
+      }
+    )
+    expect(root.helpers).toContain(NORMALIZE_STYLE)
+    expect(node.props).toMatchObject({
+      type: NodeTypes.JS_OBJECT_EXPRESSION,
+      properties: [
+        {
+          type: NodeTypes.JS_PROPERTY,
+          key: {
+            type: NodeTypes.SIMPLE_EXPRESSION,
+            content: `style`,
+            isStatic: true
+          },
+          value: {
+            type: NodeTypes.JS_CALL_EXPRESSION,
+            callee: NORMALIZE_STYLE
+          }
+        }
+      ]
+    })
+  })
+
+  test(':style with array literal', () => {
+    const { node, root } = parseWithElementTransform(
+      `<div :style="[{ color: 'red' }]" />`,
+      {
+        nodeTransforms: [transformExpression, transformStyle, transformElement],
+        directiveTransforms: {
+          bind: transformBind
+        },
+        prefixIdentifiers: true
+      }
+    )
+    expect(root.helpers).toContain(NORMALIZE_STYLE)
+    expect(node.props).toMatchObject({
+      type: NodeTypes.JS_OBJECT_EXPRESSION,
+      properties: [
+        {
+          type: NodeTypes.JS_PROPERTY,
+          key: {
+            type: NodeTypes.SIMPLE_EXPRESSION,
+            content: `style`,
+            isStatic: true
+          },
+          value: {
+            type: NodeTypes.JS_CALL_EXPRESSION,
+            callee: NORMALIZE_STYLE
+          }
+        }
+      ]
+    })
+  })
+
   test(`props merging: class`, () => {
-    const { node } = parseWithElementTransform(
+    const { node, root } = parseWithElementTransform(
       `<div class="foo" :class="{ bar: isBar }" />`,
       {
         directiveTransforms: {
@@ -678,6 +880,7 @@ describe('compiler: element transform', () => {
         }
       }
     )
+    expect(root.helpers).toContain(NORMALIZE_CLASS)
     expect(node.props).toMatchObject({
       type: NodeTypes.JS_OBJECT_EXPRESSION,
       properties: [
@@ -689,17 +892,23 @@ describe('compiler: element transform', () => {
             isStatic: true
           },
           value: {
-            type: NodeTypes.JS_ARRAY_EXPRESSION,
-            elements: [
+            type: NodeTypes.JS_CALL_EXPRESSION,
+            callee: NORMALIZE_CLASS,
+            arguments: [
               {
-                type: NodeTypes.SIMPLE_EXPRESSION,
-                content: `foo`,
-                isStatic: true
-              },
-              {
-                type: NodeTypes.SIMPLE_EXPRESSION,
-                content: `{ bar: isBar }`,
-                isStatic: false
+                type: NodeTypes.JS_ARRAY_EXPRESSION,
+                elements: [
+                  {
+                    type: NodeTypes.SIMPLE_EXPRESSION,
+                    content: `foo`,
+                    isStatic: true
+                  },
+                  {
+                    type: NodeTypes.SIMPLE_EXPRESSION,
+                    content: `{ bar: isBar }`,
+                    isStatic: false
+                  }
+                ]
               }
             ]
           }
@@ -789,8 +998,96 @@ describe('compiler: element transform', () => {
     })
 
     test('NEED_PATCH (vnode hooks)', () => {
-      const { node } = parseWithBind(`<div @vnodeUpdated="foo" />`)
+      const root = baseCompile(`<div @vue:updated="foo" />`, {
+        prefixIdentifiers: true,
+        cacheHandlers: true
+      }).ast
+      const node = (root as any).children[0].codegenNode
       expect(node.patchFlag).toBe(genFlagText(PatchFlags.NEED_PATCH))
+    })
+
+    test('script setup inline mode template ref (binding exists)', () => {
+      const { node } = parseWithElementTransform(`<input ref="input"/>`, {
+        inline: true,
+        bindingMetadata: {
+          input: BindingTypes.SETUP_REF
+        }
+      })
+      expect(node.props).toMatchObject({
+        type: NodeTypes.JS_OBJECT_EXPRESSION,
+        properties: [
+          {
+            type: NodeTypes.JS_PROPERTY,
+            key: {
+              content: 'ref_key',
+              isStatic: true
+            },
+            value: {
+              content: 'input',
+              isStatic: true
+            }
+          },
+          {
+            type: NodeTypes.JS_PROPERTY,
+            key: {
+              content: 'ref',
+              isStatic: true
+            },
+            value: {
+              content: 'input',
+              isStatic: false
+            }
+          }
+        ]
+      })
+    })
+
+    test('script setup inline mode template ref (binding does not exist)', () => {
+      const { node } = parseWithElementTransform(`<input ref="input"/>`, {
+        inline: true
+      })
+      expect(node.props).toMatchObject({
+        type: NodeTypes.JS_OBJECT_EXPRESSION,
+        properties: [
+          {
+            type: NodeTypes.JS_PROPERTY,
+            key: {
+              content: 'ref',
+              isStatic: true
+            },
+            value: {
+              content: 'input',
+              isStatic: true
+            }
+          }
+        ]
+      })
+    })
+
+    test('script setup inline mode template ref (binding does not exist but props with the same name exist)', () => {
+      const { node } = parseWithElementTransform(`<input ref="msg"/>`, {
+        inline: true,
+        bindingMetadata: {
+          msg: BindingTypes.PROPS,
+          ref: BindingTypes.SETUP_CONST
+        }
+      })
+      expect(node.props).toMatchObject({
+        type: NodeTypes.JS_OBJECT_EXPRESSION,
+        properties: [
+          {
+            type: NodeTypes.JS_PROPERTY,
+            key: {
+              content: 'ref',
+              isStatic: true
+            },
+            value: {
+              content: 'msg',
+              isStatic: true
+            }
+          }
+        ]
+      })
     })
 
     test('HYDRATE_EVENTS', () => {
@@ -815,11 +1112,44 @@ describe('compiler: element transform', () => {
         genFlagText([PatchFlags.PROPS, PatchFlags.HYDRATE_EVENTS])
       )
     })
+
+    // #5870
+    test('HYDRATE_EVENTS on dynamic component', () => {
+      const { node } = parseWithElementTransform(
+        `<component :is="foo" @input="foo" />`,
+        {
+          directiveTransforms: {
+            on: transformOn
+          }
+        }
+      )
+      expect(node.patchFlag).toBe(
+        genFlagText([PatchFlags.PROPS, PatchFlags.HYDRATE_EVENTS])
+      )
+    })
   })
 
   describe('dynamic component', () => {
     test('static binding', () => {
       const { node, root } = parseWithBind(`<component is="foo" />`)
+      expect(root.helpers).toContain(RESOLVE_DYNAMIC_COMPONENT)
+      expect(node).toMatchObject({
+        isBlock: true,
+        tag: {
+          callee: RESOLVE_DYNAMIC_COMPONENT,
+          arguments: [
+            {
+              type: NodeTypes.SIMPLE_EXPRESSION,
+              content: 'foo',
+              isStatic: true
+            }
+          ]
+        }
+      })
+    })
+
+    test('capitalized version w/ static binding', () => {
+      const { node, root } = parseWithBind(`<Component is="foo" />`)
       expect(root.helpers).toContain(RESOLVE_DYNAMIC_COMPONENT)
       expect(node).toMatchObject({
         isBlock: true,
@@ -854,6 +1184,7 @@ describe('compiler: element transform', () => {
       })
     })
 
+    // TODO remove in 3.4
     test('v-is', () => {
       const { node, root } = parseWithBind(`<div v-is="'foo'" />`)
       expect(root.helpers).toContain(RESOLVE_DYNAMIC_COMPONENT)
@@ -871,6 +1202,19 @@ describe('compiler: element transform', () => {
         // should skip v-is runtime check
         directives: undefined
       })
+      expect('v-is="component-name" has been deprecated').toHaveBeenWarned()
+    })
+
+    // #3934
+    test('normal component with is prop', () => {
+      const { node, root } = parseWithBind(`<custom-input is="foo" />`, {
+        isNativeTag: () => false
+      })
+      expect(root.helpers).toContain(RESOLVE_COMPONENT)
+      expect(root.helpers).not.toContain(RESOLVE_DYNAMIC_COMPONENT)
+      expect(node).toMatchObject({
+        tag: '_component_custom_input'
+      })
     })
   })
 
@@ -886,6 +1230,18 @@ describe('compiler: element transform', () => {
     })
   })
 
+  test('force block for runtime custom directive w/ children', () => {
+    const { node } = parseWithElementTransform(`<div v-foo>hello</div>`)
+    expect(node.isBlock).toBe(true)
+  })
+
+  test('force block for inline before-update handlers w/ children', () => {
+    expect(
+      parseWithElementTransform(`<div @vue:before-update>hello</div>`).node
+        .isBlock
+    ).toBe(true)
+  })
+
   // #938
   test('element with dynamic keys should be forced into blocks', () => {
     const ast = parse(`<div><div :key="foo" /></div>`)
@@ -896,6 +1252,37 @@ describe('compiler: element transform', () => {
       type: NodeTypes.VNODE_CALL,
       tag: `"div"`,
       isBlock: true
+    })
+  })
+
+  test('should process node when node has been replaced', () => {
+    // a NodeTransform that swaps out <div id="foo" /> with <span id="foo" />
+    const customNodeTransform: NodeTransform = (node, context) => {
+      if (
+        node.type === NodeTypes.ELEMENT &&
+        node.tag === 'div' &&
+        node.props.some(
+          prop =>
+            prop.type === NodeTypes.ATTRIBUTE &&
+            prop.name === 'id' &&
+            prop.value &&
+            prop.value.content === 'foo'
+        )
+      ) {
+        context.replaceNode({
+          ...node,
+          tag: 'span'
+        })
+      }
+    }
+    const ast = parse(`<div><div id="foo" /></div>`)
+    transform(ast, {
+      nodeTransforms: [transformElement, transformText, customNodeTransform]
+    })
+    expect((ast as any).children[0].children[0].codegenNode).toMatchObject({
+      type: NodeTypes.VNODE_CALL,
+      tag: '"span"',
+      isBlock: false
     })
   })
 })
